@@ -1,0 +1,638 @@
+#ifndef ASSOCIATIVE_ARRAY_HPP
+#define ASSOCIATIVE_ARRAY_HPP
+
+#include <cstddef>
+#include <optional>
+#include <utility>
+#include <vector>
+
+/**
+ * Represents a mapping of keys to values.
+ * @tparam K the type of the keys
+ * @tparam V the type of the values
+ */
+template <typename K, typename V>
+class AssociativeArray {
+public:
+    virtual ~AssociativeArray() = default;
+
+    /**
+     * Insert the mapping from the key, @p k, to the value, @p v.
+     * If the key already maps to a value, replace the mapping.
+     */
+    virtual void set(const K& k, const V& v) = 0;
+
+    /** @return true if @p k is a key in the associative array. */
+    virtual bool contains(const K& k) const = 0;
+
+    /**
+     * @return the value associated with the key @p k, or std::nullopt
+     *         if the key doesn't exist.
+     */
+    virtual std::optional<V> get(const K& k) const = 0;
+
+    /**
+     * Remove the key, @p k, from the associative array.
+     * @return true if the item was removed, false if the key was not found.
+     */
+    virtual bool remove(const K& k) = 0;
+
+    /** @return the number of key/value pairs stored. */
+    virtual std::size_t size() const = 0;
+
+    /** @return the full list of key/value pairs (in no particular order). */
+    virtual std::vector<std::pair<K, V>> keyValuePairs() const = 0;
+};
+
+#endif  // ASSOCIATIVE_ARRAY_HPP
+#ifndef HASH_TABLE_HPP
+#define HASH_TABLE_HPP
+
+#include <array>
+#include <cstddef>
+#include <functional>
+#include <optional>
+#include <utility>
+#include <vector>
+
+#include "associative_array.hpp"
+
+/**
+ * An associative array backed by a hash table that uses
+ *  - separate chaining (each bucket is a singly linked list), and
+ *  - the division method for hashing: index = hash(key) mod m,
+ *    where m (the bucket count) is always a prime.
+ *
+ * The bucket count follows the "good hash table primes" list
+ * (https://planetmath.org/goodhashtableprimes), where each prime is roughly
+ * double the previous one and far from a power of two. When the load factor
+ * (size / buckets) would exceed 1.0, the table grows to the next prime and all
+ * nodes are relinked (rehashed) into the new bucket array.
+ *
+ * Expected running time of set/get/contains/remove is O(1); keyValuePairs is
+ * O(n + m).
+ *
+ * @tparam K        key type
+ * @tparam V        value type
+ * @tparam Hash     hash functor (defaults to std::hash<K>)
+ * @tparam KeyEqual key equality functor (defaults to std::equal_to<K>)
+ */
+template <typename K, typename V,
+          typename Hash = std::hash<K>,
+          typename KeyEqual = std::equal_to<K>>
+class HashTable : public AssociativeArray<K, V> {
+public:
+    /** Creates an empty table with the smallest prime bucket count. */
+    HashTable() : buckets_(kPrimes[0], nullptr) {}
+
+    /** Copy constructor: deep copies every node. */
+    HashTable(const HashTable& other)
+        : buckets_(other.buckets_.size(), nullptr),
+          size_(other.size_),
+          primeIndex_(other.primeIndex_),
+          hash_(other.hash_),
+          eq_(other.eq_) {
+        for (std::size_t i = 0; i < other.buckets_.size(); ++i) {
+            Node* tail = nullptr;
+            for (Node* n = other.buckets_[i]; n != nullptr; n = n->next) {
+                Node* copy = new Node{n->key, n->value, nullptr};
+                if (tail == nullptr) buckets_[i] = copy;
+                else tail->next = copy;
+                tail = copy;
+            }
+        }
+    }
+
+    /** Move constructor: steals the other table's storage. */
+    HashTable(HashTable&& other) noexcept : HashTable() { swap(other); }
+
+    /** Copy/move assignment via copy-and-swap (by-value parameter). */
+    HashTable& operator=(HashTable other) noexcept {
+        swap(other);
+        return *this;
+    }
+
+    ~HashTable() override { clear(); }
+
+    /** Swaps the contents of two tables. */
+    void swap(HashTable& other) noexcept {
+        std::swap(buckets_, other.buckets_);
+        std::swap(size_, other.size_);
+        std::swap(primeIndex_, other.primeIndex_);
+        std::swap(hash_, other.hash_);
+        std::swap(eq_, other.eq_);
+    }
+
+    void set(const K& k, const V& v) override {
+        Node* existing = find(k);
+        if (existing != nullptr) {
+            existing->value = v;  // replace the existing mapping
+            return;
+        }
+        // Grow first if adding this element would push load factor above 1.
+        if (size_ + 1 > buckets_.size()) rehash();
+        std::size_t idx = indexFor(k);
+        buckets_[idx] = new Node{k, v, buckets_[idx]};  // insert at chain head
+        ++size_;
+    }
+
+    bool contains(const K& k) const override { return find(k) != nullptr; }
+
+    std::optional<V> get(const K& k) const override {
+        const Node* n = find(k);
+        if (n == nullptr) return std::nullopt;
+        return n->value;
+    }
+
+    bool remove(const K& k) override {
+        std::size_t idx = indexFor(k);
+        Node* prev = nullptr;
+        for (Node* cur = buckets_[idx]; cur != nullptr; prev = cur, cur = cur->next) {
+            if (eq_(cur->key, k)) {
+                if (prev == nullptr) buckets_[idx] = cur->next;
+                else prev->next = cur->next;
+                delete cur;
+                --size_;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::size_t size() const override { return size_; }
+
+    std::vector<std::pair<K, V>> keyValuePairs() const override {
+        std::vector<std::pair<K, V>> result;
+        result.reserve(size_);
+        for (Node* head : buckets_) {
+            for (Node* n = head; n != nullptr; n = n->next) {
+                result.emplace_back(n->key, n->value);
+            }
+        }
+        return result;
+    }
+
+    /** @return the current number of buckets (always one of the table primes). */
+    std::size_t bucketCount() const { return buckets_.size(); }
+
+    /** @return size() / bucketCount(). */
+    double loadFactor() const {
+        return static_cast<double>(size_) / static_cast<double>(buckets_.size());
+    }
+
+private:
+    /** A single link in a bucket's chain. */
+    struct Node {
+        K key;
+        V value;
+        Node* next;
+    };
+
+    /** Good hash table primes (https://planetmath.org/goodhashtableprimes). */
+    static constexpr std::array<std::size_t, 26> kPrimes = {
+        53, 97, 193, 389, 769, 1543, 3079, 6151, 12289, 24593, 49157, 98317,
+        196613, 393241, 786433, 1572869, 3145739, 6291469, 12582917, 25165843,
+        50331653, 100663319, 201326611, 402653189, 805306457, 1610612741};
+
+    std::vector<Node*> buckets_;
+    std::size_t size_ = 0;
+    std::size_t primeIndex_ = 0;
+    Hash hash_;
+    KeyEqual eq_;
+
+    /** Division method: hash(k) mod (number of buckets). */
+    std::size_t indexFor(const K& k) const { return hash_(k) % buckets_.size(); }
+
+    /** @return the node holding @p k, or nullptr. */
+    Node* find(const K& k) const {
+        for (Node* n = buckets_[indexFor(k)]; n != nullptr; n = n->next) {
+            if (eq_(n->key, k)) return n;
+        }
+        return nullptr;
+    }
+
+    /**
+     * Grows to the next prime in the table and relinks every existing node
+     * into the new bucket array (no nodes are allocated or copied).
+     * If already at the largest prime, the table simply keeps chaining.
+     */
+    void rehash() {
+        if (primeIndex_ + 1 >= kPrimes.size()) return;
+        ++primeIndex_;
+        std::vector<Node*> newBuckets(kPrimes[primeIndex_], nullptr);
+        for (Node* head : buckets_) {
+            Node* n = head;
+            while (n != nullptr) {
+                Node* next = n->next;
+                std::size_t idx = hash_(n->key) % newBuckets.size();
+                n->next = newBuckets[idx];
+                newBuckets[idx] = n;
+                n = next;
+            }
+        }
+        buckets_.swap(newBuckets);
+    }
+
+    /** Deletes every node (iteratively, so long chains can't overflow the stack). */
+    void clear() {
+        for (Node*& head : buckets_) {
+            while (head != nullptr) {
+                Node* next = head->next;
+                delete head;
+                head = next;
+            }
+        }
+        size_ = 0;
+    }
+};
+
+#endif  // HASH_TABLE_HPP
+#ifndef LZ_ENCODER_HPP
+#define LZ_ENCODER_HPP
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "hash_table.hpp"
+
+/**
+ * Lempel-Ziv (LZ78) encoder built on our HashTable.
+ *
+ * The input is parsed into phrases. Each phrase is the longest phrase already
+ * seen plus one new byte, so it is described by a token
+ * (index of the earlier phrase, new byte). Index 0 means "empty phrase".
+ *
+ * The dictionary maps (prefix phrase index, next byte) -> phrase index. That
+ * pair is packed into one 64-bit key: (index << 8) | byte.
+ */
+struct LZToken {
+    std::size_t prefix;  ///< 1-based index of the earlier phrase (0 = empty)
+    unsigned char ch;    ///< the byte appended to that phrase
+    bool operator==(const LZToken& o) const { return prefix == o.prefix && ch == o.ch; }
+};
+
+/**
+ * Parses @p input into LZ78 tokens.
+ * If the input ends in the middle of a phrase that is already in the
+ * dictionary, a final token (index, 0) is emitted; the original length stored
+ * in the bit-string header tells a decoder to drop that padding byte.
+ */
+inline std::vector<LZToken> lzTokens(const std::string& input) {
+    HashTable<std::uint64_t, std::size_t> dict;
+    std::vector<LZToken> tokens;
+    std::size_t current = 0;  // phrase matched so far (0 = empty)
+    std::size_t nextIndex = 1;
+    for (unsigned char c : input) {
+        std::uint64_t key = (static_cast<std::uint64_t>(current) << 8) | c;
+        auto found = dict.get(key);
+        if (found) {
+            current = *found;  // keep extending the current phrase
+        } else {
+            tokens.push_back({current, c});
+            dict.set(key, nextIndex++);  // new phrase = current phrase + c
+            current = 0;
+        }
+    }
+    if (current != 0) tokens.push_back({current, 0});
+    return tokens;
+}
+
+/** Number of bits needed to write a number in [0, n-1]: ceil(log2(n)). */
+inline unsigned bitsForChoices(std::size_t n) {
+    unsigned bits = 0;
+    while ((std::size_t{1} << bits) < n) ++bits;
+    return bits;
+}
+
+/** Appends the low @p nbits of @p value to @p out as '0'/'1' chars, MSB first. */
+inline void appendBits(std::string& out, std::uint64_t value, unsigned nbits) {
+    for (unsigned i = nbits; i-- > 0;) out.push_back(((value >> i) & 1) ? '1' : '0');
+}
+
+/**
+ * Encodes @p input into a string of '0'/'1' characters:
+ *   [32 bits: original length in bytes]
+ *   for the i-th token (i starting at 1):
+ *     [ceil(log2(i)) bits: prefix index (it can only be 0..i-1)]
+ *     [8 bits: new byte]
+ */
+inline std::string lzEncodeBits(const std::string& input) {
+    std::string bits;
+    appendBits(bits, input.size(), 32);
+    std::size_t i = 1;
+    for (const LZToken& t : lzTokens(input)) {
+        appendBits(bits, t.prefix, bitsForChoices(i));
+        appendBits(bits, t.ch, 8);
+        ++i;
+    }
+    return bits;
+}
+
+/** Packs a '0'/'1' string into bytes (MSB first, zero-padded at the end). */
+inline std::string packBits(const std::string& bits) {
+    std::string bytes((bits.size() + 7) / 8, '\0');
+    for (std::size_t i = 0; i < bits.size(); ++i)
+        if (bits[i] == '1') bytes[i / 8] |= static_cast<char>(0x80 >> (i % 8));
+    return bytes;
+}
+
+/** Convenience: LZ78-compress @p input into a packed byte string. */
+inline std::string lzCompress(const std::string& input) {
+    return packBits(lzEncodeBits(input));
+}
+
+#endif  // LZ_ENCODER_HPP// Usage: ./lz <input-file> [packed-output-file] [bit-string-output-file]
+// Compresses a file with LZ78 and reports the compression ratio.
+#include <fstream>
+#include <iostream>
+#include <iterator>
+
+#include "lz_encoder.hpp"
+
+int main(int argc, char** argv) {
+    if (argc < 2) { std::cerr << "usage: " << argv[0] << " <input> [output] [bits-output]\n"; return 1; }
+    std::ifstream in(argv[1], std::ios::binary);
+    if (!in) { std::cerr << "cannot open " << argv[1] << "\n"; return 1; }
+    std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+
+    std::string bits = lzEncodeBits(data);
+    std::string packed = packBits(bits);
+    std::cout << "original bytes:   " << data.size() << "\n"
+              << "phrases:          " << lzTokens(data).size() << "\n"
+              << "compressed bytes: " << packed.size() << "\n"
+              << "ratio:            "
+              << (data.empty() ? 0.0 : static_cast<double>(packed.size()) / data.size()) << "\n";
+    if (argc > 2) std::ofstream(argv[2], std::ios::binary) << packed;
+    if (argc > 3) std::ofstream(argv[3]) << bits;
+    return 0;
+}// g++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined lz_tests.cpp -o lz_tests && ./lz_tests
+#include <iostream>
+#include "lz_encoder.hpp"
+
+static int checks = 0, failures = 0;
+#define CHECK(c) do { ++checks; if (!(c)) { ++failures; std::cerr << "FAIL line " << __LINE__ << ": " #c "\n"; } } while (0)
+
+int main() {
+    // Empty input: no tokens, just the 32-bit length header.
+    CHECK(lzTokens("").empty());
+    CHECK(lzEncodeBits("").size() == 32);
+
+    // ABABABA -> A | B | AB | ABA
+    auto t = lzTokens("ABABABA");
+    CHECK(t.size() == 4);
+    CHECK((t[0] == LZToken{0, 'A'}));
+    CHECK((t[1] == LZToken{0, 'B'}));
+    CHECK((t[2] == LZToken{1, 'B'}));
+    CHECK((t[3] == LZToken{3, 'A'}));
+    // 32 header + (0+8) + (1+8) + (2+8) + (2+8) bits
+    CHECK(lzEncodeBits("ABABABA").size() == 69);
+
+    // Input ending mid-phrase: A | (A,pad)
+    auto e = lzTokens("AA");
+    CHECK(e.size() == 2);
+    CHECK((e[1] == LZToken{1, 0}));
+
+    // Exact bit contents for "A": header=1, token (0 bits prefix, 0x41)
+    CHECK(lzEncodeBits("A") == std::string(31, '0') + "1" + "01000001");
+
+    // Packing
+    CHECK(packBits("1") == std::string(1, static_cast<char>(0x80)));
+    CHECK(packBits("101010101").size() == 2);
+    CHECK(lzCompress("A").size() == 5);
+
+    // Repetitive data compresses; every phrase is distinct for random-ish data.
+    std::string rep(10000, 'a');
+    CHECK(lzCompress(rep).size() < 1000);
+    CHECK(lzTokens(rep).size() < 200);
+
+    // Binary-safe (NUL bytes and high bytes).
+    std::string bin = std::string("\0\xff\0\xff", 4);
+    CHECK(lzTokens(bin).size() == 3);
+
+    std::cout << checks << " checks, " << failures << " failures\n";
+    return failures ? 1 : 0;
+}// Unit tests for HashTable. Build & run:
+//   g++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined tests.cpp -o tests && ./tests
+#include <algorithm>
+#include <cstdlib>
+#include <iostream>
+#include <map>
+#include <string>
+
+#include "hash_table.hpp"
+
+static int g_checks = 0, g_failures = 0;
+
+#define CHECK(cond)                                                          \
+    do {                                                                     \
+        ++g_checks;                                                          \
+        if (!(cond)) {                                                       \
+            ++g_failures;                                                    \
+            std::cerr << "FAIL " << __FILE__ << ":" << __LINE__ << "  "      \
+                      << #cond << "\n";                                      \
+        }                                                                    \
+    } while (0)
+
+#define RUN(test)                                                            \
+    do {                                                                     \
+        std::cout << "running " #test "\n";                                  \
+        test();                                                              \
+    } while (0)
+
+/** A deliberately terrible hash: every key collides into one bucket. */
+struct ConstantHash {
+    std::size_t operator()(int) const { return 42; }
+};
+
+void testEmptyTable() {
+    HashTable<int, std::string> t;
+    CHECK(t.size() == 0);
+    CHECK(!t.contains(1));
+    CHECK(!t.get(1).has_value());
+    CHECK(!t.remove(1));
+    CHECK(t.keyValuePairs().empty());
+}
+
+void testSetGetContains() {
+    HashTable<std::string, int> t;
+    t.set("one", 1);
+    t.set("two", 2);
+    CHECK(t.size() == 2);
+    CHECK(t.contains("one"));
+    CHECK(t.contains("two"));
+    CHECK(!t.contains("three"));
+    CHECK(t.get("one").value() == 1);
+    CHECK(t.get("two").value() == 2);
+    CHECK(!t.get("three").has_value());
+}
+
+void testSetReplacesExisting() {
+    HashTable<std::string, int> t;
+    t.set("a", 1);
+    t.set("a", 99);
+    CHECK(t.size() == 1);
+    CHECK(t.get("a").value() == 99);
+    CHECK(t.keyValuePairs().size() == 1);
+}
+
+void testRemove() {
+    HashTable<int, int> t;
+    for (int i = 0; i < 10; ++i) t.set(i, i * i);
+    CHECK(t.remove(3));
+    CHECK(!t.contains(3));
+    CHECK(t.size() == 9);
+    CHECK(!t.remove(3));       // already gone
+    CHECK(!t.remove(1000));    // never existed
+    CHECK(t.get(4).value() == 16);  // others untouched
+    t.set(3, 7);               // can re-insert
+    CHECK(t.get(3).value() == 7);
+    CHECK(t.size() == 10);
+}
+
+void testCollisionsWithSeparateChaining() {
+    HashTable<int, int, ConstantHash> t;  // everything lands in one chain
+    for (int i = 0; i < 100; ++i) t.set(i, i + 1000);
+    CHECK(t.size() == 100);
+    for (int i = 0; i < 100; ++i) CHECK(t.get(i).value() == i + 1000);
+
+    // Remove head, middle, and tail positions of the chain.
+    CHECK(t.remove(99));  // most recently inserted = chain head
+    CHECK(t.remove(50));  // middle
+    CHECK(t.remove(0));   // oldest = chain tail
+    CHECK(t.size() == 97);
+    CHECK(!t.contains(99) && !t.contains(50) && !t.contains(0));
+    CHECK(t.contains(1) && t.contains(98));
+
+    t.set(42, -1);  // replace within a long chain
+    CHECK(t.get(42).value() == -1);
+    CHECK(t.size() == 97);
+}
+
+void testRehashGrowsAndPreservesData() {
+    HashTable<int, int> t;
+    std::size_t initialBuckets = t.bucketCount();
+    CHECK(initialBuckets == 53);
+
+    const int N = 5000;
+    for (int i = 0; i < N; ++i) {
+        t.set(i, i * 2);
+        CHECK(t.loadFactor() <= 1.0);
+    }
+    CHECK(t.bucketCount() > initialBuckets);
+    CHECK(t.size() == static_cast<std::size_t>(N));
+    for (int i = 0; i < N; ++i) {
+        CHECK(t.contains(i));
+        CHECK(t.get(i).value() == i * 2);
+    }
+}
+
+void testBucketCountsArePrimesFromList() {
+    HashTable<int, int> t;
+    const std::size_t expected[] = {53, 97, 193, 389, 769, 1543};
+    std::size_t seen = 0;
+    std::size_t last = 0;
+    for (int i = 0; i < 1500; ++i) {
+        t.set(i, i);
+        if (t.bucketCount() != last) {
+            last = t.bucketCount();
+            CHECK(seen < 6 && last == expected[seen]);
+            ++seen;
+        }
+    }
+    CHECK(seen == 6);
+}
+
+void testKeyValuePairs() {
+    HashTable<int, std::string> t;
+    for (int i = 0; i < 200; ++i) t.set(i, "v" + std::to_string(i));
+    t.remove(10);
+    auto pairs = t.keyValuePairs();
+    CHECK(pairs.size() == 199);
+    std::sort(pairs.begin(), pairs.end());
+    for (std::size_t i = 0; i + 1 < pairs.size(); ++i)
+        CHECK(pairs[i].first < pairs[i + 1].first);  // no duplicates
+    for (const auto& [k, v] : pairs) CHECK(v == "v" + std::to_string(k));
+}
+
+void testCopySemantics() {
+    HashTable<int, int> a;
+    for (int i = 0; i < 300; ++i) a.set(i, i);
+    HashTable<int, int> b(a);  // copy construct
+    a.set(0, -5);
+    a.remove(1);
+    CHECK(b.size() == 300);
+    CHECK(b.get(0).value() == 0);  // independent of a
+    CHECK(b.contains(1));
+
+    HashTable<int, int> c;
+    c.set(-1, -1);
+    c = b;  // copy assign
+    b.set(2, 500);
+    CHECK(c.size() == 300);
+    CHECK(!c.contains(-1));
+    CHECK(c.get(2).value() == 2);
+
+    c = c;  // self assignment is safe
+    CHECK(c.size() == 300);
+}
+
+void testMoveSemantics() {
+    HashTable<int, int> a;
+    for (int i = 0; i < 100; ++i) a.set(i, i);
+    HashTable<int, int> b(std::move(a));
+    CHECK(b.size() == 100);
+    CHECK(a.size() == 0);   // moved-from table is valid and empty
+    a.set(1, 1);            // ...and still usable
+    CHECK(a.get(1).value() == 1);
+}
+
+void testPolymorphicUse() {
+    AssociativeArray<std::string, int>* arr = new HashTable<std::string, int>();
+    arr->set("x", 10);
+    CHECK(arr->contains("x"));
+    CHECK(arr->get("x").value() == 10);
+    delete arr;  // virtual destructor
+}
+
+void testRandomizedAgainstStdMap() {
+    std::srand(12345);
+    HashTable<int, int> t;
+    std::map<int, int> ref;
+    for (int step = 0; step < 20000; ++step) {
+        int key = std::rand() % 1000;
+        int op = std::rand() % 3;
+        if (op == 0) {
+            int val = std::rand();
+            t.set(key, val);
+            ref[key] = val;
+        } else if (op == 1) {
+            CHECK(t.remove(key) == (ref.erase(key) == 1));
+        } else {
+            auto it = ref.find(key);
+            auto got = t.get(key);
+            CHECK(got.has_value() == (it != ref.end()));
+            if (got) CHECK(*got == it->second);
+        }
+        CHECK(t.size() == ref.size());
+    }
+}
+
+int main() {
+    RUN(testEmptyTable);
+    RUN(testSetGetContains);
+    RUN(testSetReplacesExisting);
+    RUN(testRemove);
+    RUN(testCollisionsWithSeparateChaining);
+    RUN(testRehashGrowsAndPreservesData);
+    RUN(testBucketCountsArePrimesFromList);
+    RUN(testKeyValuePairs);
+    RUN(testCopySemantics);
+    RUN(testMoveSemantics);
+    RUN(testPolymorphicUse);
+    RUN(testRandomizedAgainstStdMap);
+
+    std::cout << g_checks << " checks, " << g_failures << " failures\n";
+    return g_failures == 0 ? 0 : 1;
+}
