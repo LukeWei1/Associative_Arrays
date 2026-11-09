@@ -13,3 +13,13 @@ The small sample did not compress (ratio 1.01). With only 90 bytes there are few
 to use many unique phrases, and each phrase costs a pointer plus 8 bits. 
 This shows that the Limpel Ziv algorithm improves as the input grows, because the dictionary has more phrases to reuse. 
 The hash table keeps each dictionary lookup at expected O(1), so encoding time grows roughly linearly with input size.
+
+**How to Run**
+
+**Compile and run tests**
+g++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined tests.cpp -o tests && ./tests
+g++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined lz_tests.cpp -o lz_tests && ./lz_tests
+
+**Compile and run encoder**
+g++ -std=c++17 -O2 lz_main.cpp -o lz
+./lz <input-file> [packed-output-file] [bit-string-output-file]
